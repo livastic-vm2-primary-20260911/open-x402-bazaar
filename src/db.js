@@ -130,12 +130,11 @@ async function attachAccepts(env, rows) {
   });
 }
 
-// Recomputes the catalog_stats cache row from a real (expensive) full scan. Only
-// ever called from write paths (submit/delete/import) — never from a read path —
-// since writes are rare relative to page views. See the catalog_stats comment in
-// schema.sql for why this exists.
-async function recomputeCatalogStats(env) {
-  await env.DB.batch([
+// D1's batch() is a transaction: all statements commit or all roll back.
+// Keep catalog counts inside the same batch as owner submissions to avoid
+// publishing partially replaced listings (or inconsistent counters).
+function catalogStatsStatements(env) {
+  return [
     env.DB
       .prepare(
         `UPDATE catalog_stats SET
@@ -153,80 +152,105 @@ async function recomputeCatalogStats(env) {
     env.DB.prepare(
       'INSERT INTO network_stats (network, count) SELECT network, COUNT(DISTINCT resource_id) FROM resource_accepts GROUP BY network'
     ),
-  ]);
+  ];
+}
+
+// Only called from write paths (not page views). See schema.sql for the
+// cached aggregate design.
+async function recomputeCatalogStats(env) {
+  await env.DB.batch(catalogStatsStatements(env));
+}
+
+// Subqueries instead of an IN (?, ..., ?) assembled from arbitrarily many IDs.
+// These also cover real resubmissions with historic liveness/feature child rows.
+function listingDeleteStatements(env, host) {
+  return [
+    env.DB
+      .prepare('DELETE FROM resource_accepts WHERE resource_id IN (SELECT id FROM resources WHERE listing_host = ?)')
+      .bind(host),
+    env.DB
+      .prepare('DELETE FROM liveness_checks WHERE resource_id IN (SELECT id FROM resources WHERE listing_host = ?)')
+      .bind(host),
+    env.DB
+      .prepare('DELETE FROM feature_purchases WHERE resource_id IN (SELECT id FROM resources WHERE listing_host = ?)')
+      .bind(host),
+    env.DB.prepare('DELETE FROM resources WHERE listing_host = ?').bind(host),
+    env.DB.prepare('DELETE FROM listings WHERE host = ?').bind(host),
+  ];
 }
 
 async function deleteListing(env, host) {
-  const { results } = await env.DB.prepare('SELECT id FROM resources WHERE listing_host = ?').bind(host).all();
-  const ids = results.map((r) => r.id);
-
-  const stmts = [];
-  if (ids.length) {
-    // resource_accepts, liveness_checks, and feature_purchases all FK-reference
-    // resources.id — every one has to be cleared before the DELETE FROM resources
-    // below, or that delete fails with a foreign key violation for any resource
-    // that's ever been liveness-checked or featured (a real re-submission would
-    // hit this, not just a hypothetical). Discovered against production D1.
-    const placeholders = ids.map(() => '?').join(',');
-    stmts.push(env.DB.prepare(`DELETE FROM resource_accepts WHERE resource_id IN (${placeholders})`).bind(...ids));
-    stmts.push(env.DB.prepare(`DELETE FROM liveness_checks WHERE resource_id IN (${placeholders})`).bind(...ids));
-    stmts.push(env.DB.prepare(`DELETE FROM feature_purchases WHERE resource_id IN (${placeholders})`).bind(...ids));
-  }
-  stmts.push(env.DB.prepare('DELETE FROM resources WHERE listing_host = ?').bind(host));
-  stmts.push(env.DB.prepare('DELETE FROM listings WHERE host = ?').bind(host));
-  await env.DB.batch(stmts);
-  await recomputeCatalogStats(env);
+  await env.DB.batch([...listingDeleteStatements(env, host), ...catalogStatsStatements(env)]);
 }
 
-// Every insert is batched (one D1 round-trip per batch, not per row) — a manifest with
-// dozens of resources/accepts previously meant dozens of sequential round-trips, which
-// took 20-30s against local D1 and would add real latency/cost against the network too.
+// D1 batches of hundreds of prepared INSERTs can exceed its SQL-variable limit.
+// Instead bind ONE JSON document and use SQLite JSON1 to ingest both tables in
+// TWO set-based INSERTs. No variable count proportional to the manifest size.
+// Newly inserted resource IDs are assigned in JSON array order; the second
+// statement maps each accepts[] to its resource by row_number() over those IDs.
+// Everything, including deletion of an existing claimed listing, is ONE atomic
+// batch. A failed write preserves the prior listing and all its child records.
 async function upsertListing(env, { host, sourceManifestUrl, manifestName, submittedAt, resources, source = 'submitted' }) {
-  await deleteListing(env, host);
-  await env.DB
-    .prepare('INSERT INTO listings (host, source_manifest_url, manifest_name, submitted_at, source) VALUES (?, ?, ?, ?, ?)')
-    .bind(host, sourceManifestUrl, manifestName || host, submittedAt, source)
-    .run();
+  // Preserve the precise previous bind semantics (JSON in text columns; nulls;
+  // empty descriptions; native numeric USD amounts) before the transactional write.
+  const rows = resources.map((r) => ({
+    resource: r.resource,
+    description: r.description || '',
+    x402Version: r.x402Version ?? null,
+    outputSchema: r.outputSchema ? JSON.stringify(r.outputSchema) : null,
+    tags: JSON.stringify(r.tags || []),
+    lastUpdated: r.lastUpdated,
+    slug: r.slug || null,
+    resourceType: r.resourceType || null,
+    metadata: r.metadata ? JSON.stringify(r.metadata) : null,
+    accepts: (r.accepts || []).map((a) => ({
+      scheme: a.scheme,
+      network: a.network,
+      payTo: a.payTo,
+      asset: a.asset || null,
+      amount: a.amount || null,
+      amountUsd: a.amountUsd ?? null,
+      maxTimeoutSeconds: a.maxTimeoutSeconds ?? null,
+    })),
+  }));
+  const payload = JSON.stringify(rows);
 
-  if (resources.length === 0) return;
-
-  const resourceStmts = resources.map((r) =>
+  await env.DB.batch([
+    ...listingDeleteStatements(env, host),
+    env.DB
+      .prepare('INSERT INTO listings (host, source_manifest_url, manifest_name, submitted_at, source) VALUES (?, ?, ?, ?, ?)')
+      .bind(host, sourceManifestUrl, manifestName || host, submittedAt, source),
     env.DB
       .prepare(
-        `INSERT INTO resources (listing_host, resource_url, description, x402_version, output_schema, tags, last_updated, slug, resource_type, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO resources
+           (listing_host, resource_url, description, x402_version, output_schema, tags, last_updated, slug, resource_type, metadata)
+         SELECT ?, json_extract(j.value, '$.resource'),
+           json_extract(j.value, '$.description'), json_extract(j.value, '$.x402Version'),
+           json_extract(j.value, '$.outputSchema'), json_extract(j.value, '$.tags'),
+           json_extract(j.value, '$.lastUpdated'), json_extract(j.value, '$.slug'),
+           json_extract(j.value, '$.resourceType'), json_extract(j.value, '$.metadata')
+         FROM json_each(?) AS j
+         ORDER BY CAST(j.key AS INTEGER)`
       )
-      .bind(
-        host,
-        r.resource,
-        r.description || '',
-        r.x402Version ?? null,
-        r.outputSchema ? JSON.stringify(r.outputSchema) : null,
-        JSON.stringify(r.tags || []),
-        r.lastUpdated,
-        r.slug || null,
-        r.resourceType || null,
-        r.metadata ? JSON.stringify(r.metadata) : null
+      .bind(host, payload),
+    env.DB
+      .prepare(
+        `INSERT INTO resource_accepts
+           (resource_id, scheme, network, pay_to, asset, amount, amount_usd, max_timeout_seconds)
+         SELECT ids.id, json_extract(a.value, '$.scheme'),
+           json_extract(a.value, '$.network'), json_extract(a.value, '$.payTo'),
+           json_extract(a.value, '$.asset'), json_extract(a.value, '$.amount'),
+           json_extract(a.value, '$.amountUsd'), json_extract(a.value, '$.maxTimeoutSeconds')
+         FROM (
+           SELECT id, row_number() OVER (ORDER BY id) - 1 AS manifest_index
+           FROM resources WHERE listing_host = ?
+         ) AS ids
+         JOIN json_each(?) AS j ON CAST(j.key AS INTEGER) = ids.manifest_index
+         JOIN json_each(j.value, '$.accepts') AS a`
       )
-  );
-  const resourceResults = await env.DB.batch(resourceStmts);
-  const resourceIds = resourceResults.map((res) => res.meta.last_row_id);
-
-  const acceptStmts = [];
-  resources.forEach((r, i) => {
-    for (const a of r.accepts) {
-      acceptStmts.push(
-        env.DB
-          .prepare(
-            `INSERT INTO resource_accepts (resource_id, scheme, network, pay_to, asset, amount, amount_usd, max_timeout_seconds)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .bind(resourceIds[i], a.scheme, a.network, a.payTo, a.asset || null, a.amount || null, a.amountUsd ?? null, a.maxTimeoutSeconds ?? null)
-      );
-    }
-  });
-  if (acceptStmts.length) await env.DB.batch(acceptStmts);
-  await recomputeCatalogStats(env);
+      .bind(host, payload),
+    ...catalogStatsStatements(env),
+  ]);
 }
 
 async function searchResources(env, { query, network, asset, scheme, payTo, maxUsdPrice, urlSubstring, limit }) {

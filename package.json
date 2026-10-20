@@ -8,7 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/smoke.test.js",
+    "test": "node test/smoke.test.js && node --test test/db-atomic.test.js",
     "db:init": "wrangler d1 execute open-x402-bazaar --local --file=schema.sql",
     "db:init:remote": "wrangler d1 execute open-x402-bazaar --remote --file=schema.sql",
     "db:migrate:remote": "wrangler d1 execute open-x402-bazaar --remote --file=migrations/0002_source_and_quality.sql",
